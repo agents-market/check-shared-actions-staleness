@@ -1,0 +1,205 @@
+name: 'Lint shared-actions SHAs'
+description: 'Warn when consumer quality-checks pins stale web3eco/shared-actions SHAs'
+author: 'agents-market'
+
+inputs:
+  threshold_days:
+    description: 'Days before a SHA is considered stale'
+    required: false
+    default: '90'
+  target_repo:
+    description: 'shared-actions repo to check against (owner/name)'
+    required: false
+    default: 'web3eco/shared-actions'
+  fail_on_stale:
+    description: 'Fail the workflow if any SHA is stale (default: false, warning only)'
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - name: Check stale shared-actions SHAs
+      uses: actions/github-script@v7
+      env:
+        THRESHOLD: ${{ inputs.threshold_days }}
+        TARGET: ${{ inputs.target_repo }}
+        FAIL_ON_STALE: ${{ inputs.fail_on_stale }}
+      with:
+        script: |
+          const fs = require('fs');
+          const path = require('path');
+
+          // ---- inputs ------------------------------------------------------
+          const thresholdDays = Number.parseInt(process.env.THRESHOLD, 10);
+          const targetRepo = process.env.TARGET;
+          const failOnStale = process.env.FAIL_ON_STALE === 'true';
+
+          if (!Number.isFinite(thresholdDays) || thresholdDays < 0) {
+            core.setFailed(`Invalid threshold_days: ${process.env.THRESHOLD}`);
+            return;
+          }
+
+          const [targetOwner, targetName] = targetRepo.split('/');
+          if (!targetOwner || !targetName) {
+            core.setFailed(`Invalid target_repo: ${targetRepo} (expected owner/name)`);
+            return;
+          }
+
+          const workspace = process.env.GITHUB_WORKSPACE || process.cwd();
+
+          // ---- discover workflow files ------------------------------------
+          let files;
+          try {
+            files = glob.sync('.github/workflows/*.{yml,yaml}', { cwd: workspace });
+          } catch (err) {
+            core.setFailed(`glob.sync failed: ${err.message}`);
+            return;
+          }
+
+          if (files.length === 0) {
+            core.notice(`No workflow files found in ${workspace}/.github/workflows/.`);
+            core.setOutput('stale_count', '0');
+            core.setOutput('total_pinned', '0');
+            core.setOutput('latest_main_sha', '');
+            return;
+          }
+
+          // ---- extract pinned SHAs from each file -------------------------
+          // Match e.g. web3eco/shared-actions/.github/workflows/x.yml@cba970e...
+          // Escape the target repo name so dots / dashes don't break the regex.
+          const repoPattern = targetRepo.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&');
+          const shaRegex = new RegExp(
+            `${repoPattern}/[^@\\s]+@([a-f0-9]{40})`,
+            'g'
+          );
+
+          const refs = [];
+          for (const relFile of files) {
+            let text;
+            try {
+              text = fs.readFileSync(path.join(workspace, relFile), 'utf8');
+            } catch (err) {
+              core.warning(`Could not read ${relFile}: ${err.message}`);
+              continue;
+            }
+            for (const match of text.matchAll(shaRegex)) {
+              const sha = match[1];
+              if (!refs.some(r => r.file === relFile && r.sha === sha)) {
+                refs.push({ file: relFile, sha });
+              }
+            }
+          }
+
+          core.setOutput('total_pinned', String(refs.length));
+          core.info(`Found ${refs.length} unique pinned ${targetRepo} reference(s) across ${files.length} workflow file(s).`);
+
+          if (refs.length === 0) {
+            core.notice(`No pinned ${targetRepo} references found. Nothing to check.`);
+            core.setOutput('stale_count', '0');
+            core.setOutput('latest_main_sha', '');
+            return;
+          }
+
+          // ---- fetch commit dates for each unique SHA ---------------------
+          const uniqueShas = [...new Set(refs.map(r => r.sha))];
+          const shaAges = new Map(); // sha -> ageDays (or null on error)
+          for (const sha of uniqueShas) {
+            try {
+              const { data } = await github.rest.repos.getCommit({
+                owner: targetOwner,
+                repo: targetName,
+                ref: sha,
+              });
+              const commitDate = new Date(data.commit.committer.date).getTime();
+              if (Number.isNaN(commitDate)) {
+                core.warning(`SHA ${sha.slice(0, 7)} returned non-parseable committer date; skipping.`);
+                shaAges.set(sha, null);
+                continue;
+              }
+              const ageDays = Math.floor((Date.now() - commitDate) / (1000 * 60 * 60 * 24));
+              shaAges.set(sha, ageDays);
+            } catch (err) {
+              core.warning(`Could not fetch commit ${sha.slice(0, 7)} from ${targetRepo}: ${err.status || ''} ${err.message}`);
+              shaAges.set(sha, null);
+            }
+          }
+
+          // ---- identify stale refs ----------------------------------------
+          const staleRefs = refs
+            .filter(r => {
+              const age = shaAges.get(r.sha);
+              return age !== null && age > thresholdDays;
+            })
+            .map(r => ({ ...r, ageDays: shaAges.get(r.sha) }));
+
+          core.setOutput('stale_count', String(staleRefs.length));
+
+          // ---- latest main SHA (best-effort) ------------------------------
+          let latestMainSha = '';
+          try {
+            const { data } = await github.rest.repos.getBranch({
+              owner: targetOwner,
+              repo: targetName,
+              branch: 'main',
+            });
+            latestMainSha = data.commit.sha;
+            core.setOutput('latest_main_sha', latestMainSha);
+          } catch (err) {
+            core.warning(`Could not fetch latest main of ${targetRepo}: ${err.status || ''} ${err.message}`);
+            core.setOutput('latest_main_sha', '');
+          }
+
+          if (staleRefs.length === 0) {
+            core.notice(`No stale ${targetRepo} SHAs found (threshold=${thresholdDays} days).`);
+            return;
+          }
+
+          // ---- build warnings + PR comment -------------------------------
+          const summary = staleRefs
+            .map(r => `- \`${r.file}\` pins \`${r.sha.slice(0, 12)}\` (${r.ageDays} days old)`)
+            .join('\n');
+
+          core.warning(
+            `Found ${staleRefs.length} stale ${targetRepo} reference(s) older than ${thresholdDays} days:\n${summary}`
+          );
+
+          if (context.eventName === 'pull_request' && context.payload.pull_request) {
+            const prNumber = context.payload.pull_request.number;
+            const tipLine = latestMainSha
+              ? `**Latest \`main\` SHA:** \`${latestMainSha.slice(0, 12)}\` — consider bumping pinned references to absorb upstream bugfixes + security patches.`
+              : `**Tip:** \`gh api repos/${targetRepo}/commits/main --jq .sha\` to discover the latest SHA.`;
+            const body = [
+              '## ⏰ Shared Actions Staleness Check',
+              '',
+              `Found **${staleRefs.length}** pinned reference(s) to \`${targetRepo}\` older than **${thresholdDays} days**:`,
+              '',
+              summary,
+              '',
+              tipLine,
+              '',
+              '_Auto-posted by [`agents-market/check-shared-actions-staleness@v1`](https://github.com/agents-market/check-shared-actions-staleness). Set \`fail_on_stale: true\` to block merge until SHAs are bumped._',
+            ].join('\n');
+
+            try {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body,
+              });
+              core.notice(`Posted PR comment to #${prNumber}.`);
+            } catch (err) {
+              core.warning(`Could not post PR comment to #${prNumber}: ${err.message}`);
+            }
+          }
+
+          if (failOnStale) {
+            core.setFailed(
+              `${staleRefs.length} stale ${targetRepo} SHA(s) found (fail_on_stale=true). Bump pinned references or set fail_on_stale=false.`
+            );
+          }
+
+branding:
+  icon: 'clock'
+  color: 'yellow'
